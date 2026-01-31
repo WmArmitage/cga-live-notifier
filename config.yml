@@ -3,7 +3,7 @@ poll:
   watch_seconds: 60
   watch_window_hours: 4
 
-global_webhook_url: "https://discord.com/api/webhooks/1454653384958410907/EfNOPcyGdfU4WzHyE4ElyK1VUcYQ5QcbdH3AXIlZxYyhGvVCpDGfwf-YkAEP-aW79aQa"
+global_webhook_url: ""
 
 committees:
   - name: "Aging"
