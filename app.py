@@ -1,6 +1,7 @@
 import os
 import time
 import sqlite3
+import logging
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
 
@@ -13,6 +14,9 @@ CFG_PATH = "/app/config.yml"
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
 YOUTUBE_VIDEOS_ENDPOINT = "https://www.googleapis.com/youtube/v3/videos"
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+logger = logging.getLogger(__name__)
 
 
 def load_config():
@@ -67,7 +71,8 @@ def parse_rfc3339(ts: str) -> int | None:
         else:
             dt = datetime.fromisoformat(ts)
         return int(dt.timestamp())
-    except Exception:
+    except (ValueError, TypeError) as exc:
+        logger.warning("Invalid RFC3339 timestamp: %s (%s)", ts, exc)
         return None
 
 
@@ -79,20 +84,29 @@ def extract_video_id(entry) -> str | None:
     return qs.get("v", [None])[0]
 
 
-def post_discord(webhook_url: str, content: str):
-    resp = requests.post(webhook_url, json={"content": content}, timeout=15)
-    resp.raise_for_status()
+def post_discord(webhook_url: str, content: str) -> bool:
+    try:
+        resp = requests.post(webhook_url, json={"content": content}, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logger.error("Discord webhook post failed: %s", exc)
+        return False
+    return True
 
 
-def yt_videos_list(video_ids: list[str]) -> dict:
+def yt_videos_list(video_ids: list[str]) -> dict | None:
     params = {
         "key": YOUTUBE_API_KEY,
         "part": "snippet,liveStreamingDetails",
         "id": ",".join(video_ids),
     }
-    r = requests.get(YOUTUBE_VIDEOS_ENDPOINT, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(YOUTUBE_VIDEOS_ENDPOINT, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        logger.error("YouTube API request failed: %s", exc)
+        return None
 
 
 def is_live(item: dict) -> bool:
@@ -111,6 +125,7 @@ def scheduled_start_ts(item: dict) -> int | None:
 
 
 def main():
+    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
     if not YOUTUBE_API_KEY:
         raise SystemExit("Missing YOUTUBE_API_KEY in environment (.env)")
 
@@ -145,7 +160,13 @@ def main():
                 committee = c["name"]
                 rss = c["rss"]
 
-                feed = feedparser.parse(rss)
+                try:
+                    feed = feedparser.parse(rss)
+                except Exception as exc:
+                    logger.error("RSS parse failed for %s: %s", rss, exc)
+                    continue
+                if getattr(feed, "bozo", False):
+                    logger.warning("RSS parse error for %s: %s", rss, feed.bozo_exception)
                 for entry in feed.entries[:12]:
                     vid = extract_video_id(entry)
                     if not vid:
@@ -182,6 +203,15 @@ def main():
             for i in range(0, len(ids), 50):
                 batch = ids[i:i+50]
                 data = yt_videos_list(batch)
+                if data is None:
+                    logger.warning("Skipping YouTube batch due to API failure: %s", batch)
+                    for vid in batch:
+                        cur.execute(
+                            "UPDATE watch_queue SET next_check_ts=? WHERE video_id=?",
+                            (now + watch_seconds, vid),
+                        )
+                    conn.commit()
+                    continue
                 items = {it["id"]: it for it in data.get("items", [])}
 
                 for vid in batch:
@@ -199,12 +229,19 @@ def main():
                         cur.execute("SELECT 1 FROM notified_live WHERE video_id=?", (vid,))
                         if cur.fetchone() is None:
                             msg = f"**{committee} Committee is Live!**\nhttps://www.youtube.com/watch?v={vid}"
-                            post_discord(webhook, msg)
-                            cur.execute(
-                                "INSERT INTO notified_live(video_id, committee, notified_ts) VALUES(?,?,?)",
-                                (vid, committee, now),
-                            )
-                            conn.commit()
+                            if post_discord(webhook, msg):
+                                cur.execute(
+                                    "INSERT INTO notified_live(video_id, committee, notified_ts) VALUES(?,?,?)",
+                                    (vid, committee, now),
+                                )
+                                conn.commit()
+                            else:
+                                cur.execute(
+                                    "UPDATE watch_queue SET next_check_ts=? WHERE video_id=?",
+                                    (now + watch_seconds, vid),
+                                )
+                                conn.commit()
+                                continue
 
                         # stop tracking after notify
                         cur.execute("DELETE FROM watch_queue WHERE video_id=?", (vid,))
